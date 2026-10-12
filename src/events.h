@@ -13,6 +13,9 @@
 #define EVENT_WINDOW_TITLE   1322
 #define EVENT_WINDOW_CREATE  1325
 #define EVENT_WINDOW_DESTROY 1326
+// the dock creates a transient space for each minimize or deminimize animation
+#define EVENT_SPACE_CREATE   1327
+#define EVENT_SPACE_DESTROY  1328
 
 #define EVENT_SPACE_CHANGE   1401
 

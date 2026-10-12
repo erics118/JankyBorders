@@ -9,6 +9,7 @@
 #define WINDOW_TAG_STICKY        (1ULL << 11)
 #define WINDOW_TAG_IGNORES_CYCLE (1ULL << 18)
 #define WINDOW_TAG_MODAL         (1ULL << 31)
+#define WINDOW_TAG_MINIMIZED     (1ULL << 60)
 
 static inline bool window_suitable(CFTypeRef iterator) {
   uint64_t tags = SLSWindowIteratorGetTags(iterator);

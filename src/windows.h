@@ -10,6 +10,9 @@ void windows_update_notifications(struct table* windows);
 
 void windows_window_update(struct table* windows, uint32_t wid);
 void windows_window_hide(struct table* windows, uint32_t wid);
+void windows_hide_minimizing(struct table* windows);
+void windows_update_minimized(struct table* windows);
+void windows_check_mission_control(struct table* windows);
 void windows_window_unhide(struct table* windows, uint32_t wid);
 void windows_window_move(struct table* windows, uint32_t wid);
 bool windows_window_create(struct table* windows, uint32_t wid, uint64_t sid);

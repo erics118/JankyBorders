@@ -7,6 +7,7 @@
 
 extern pid_t g_pid;
 extern struct settings g_settings;
+extern bool g_mission_control;
 
 // Loaded via dlsym in main.c
 extern CFArrayRef (*JBSLSWindowIteratorGetCornerRadii)(CFTypeRef);
@@ -157,6 +158,98 @@ void windows_update_inactive(struct table* windows) {
       bucket = bucket->next;
     }
   }
+}
+
+// the minimized tag is set when the minimize animation starts
+// the hide event only arrives when it ends
+void windows_hide_minimizing(struct table* windows) {
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      if (bucket->value) {
+        struct border* border = bucket->value;
+        if (border && (window_tags(border->cid, border->target_wid)
+                       & WINDOW_TAG_MINIMIZED                     )) {
+          border_set_minimized(border, true);
+        }
+      }
+      bucket = bucket->next;
+    }
+  }
+}
+
+void windows_update_minimized(struct table* windows) {
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      if (bucket->value) {
+        struct border* border = bucket->value;
+        if (border && border->minimized) border_update(border, true);
+      }
+      bucket = bucket->next;
+    }
+  }
+}
+
+// mission control raises each window with its ordering group, edges included
+// so edges go transparent instead of ordered out
+static void windows_set_mission_control(struct table* windows, bool active) {
+  g_mission_control = active;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      if (bucket->value) {
+        struct border* border = bucket->value;
+        if (border) border_set_alpha(border, active || border->minimized ? 0.f : 1.f);
+      }
+      bucket = bucket->next;
+    }
+  }
+  if (!active) windows_draw_borders_on_current_spaces(windows);
+}
+
+// WindowManager shows the spaces bar as soon as a mission control gesture starts
+// its full screen overlay only appears once mission control is fully open
+#define MISSION_CONTROL_SPACES_BAR_LAYER 14
+#define MISSION_CONTROL_OVERLAY_LAYER 19
+
+static bool mission_control_active(void) {
+  CFArrayRef window_list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly,
+                                                      kCGNullWindowID               );
+  if (!window_list) return false;
+
+  bool found = false;
+  for (CFIndex i = 0; i < CFArrayGetCount(window_list) && !found; i++) {
+    CFDictionaryRef window = CFArrayGetValueAtIndex(window_list, i);
+    CFStringRef owner = CFDictionaryGetValue(window, kCGWindowOwnerName);
+    CFNumberRef layer_ref = CFDictionaryGetValue(window, kCGWindowLayer);
+    int layer = 0;
+    if (owner && layer_ref && CFNumberGetValue(layer_ref, kCFNumberIntType, &layer)) {
+      found = (layer == MISSION_CONTROL_SPACES_BAR_LAYER
+               || layer == MISSION_CONTROL_OVERLAY_LAYER)
+              && CFEqual(owner, CFSTR("WindowManager"));
+    }
+  }
+  CFRelease(window_list);
+  return found;
+}
+
+// no event marks mission control closing, so poll while it is open
+static void windows_poll_mission_control(struct table* windows) {
+  if (!g_mission_control) return;
+  if (!mission_control_active()) {
+    windows_set_mission_control(windows, false);
+    return;
+  }
+  DELAY_ASYNC_EXEC_ON_MAIN_THREAD(100000, {
+    windows_poll_mission_control(windows);
+  });
+}
+
+void windows_check_mission_control(struct table* windows) {
+  if (g_mission_control || !mission_control_active()) return;
+  windows_set_mission_control(windows, true);
+  windows_poll_mission_control(windows);
 }
 
 void windows_window_update(struct table* windows, uint32_t wid) {

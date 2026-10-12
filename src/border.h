@@ -78,6 +78,8 @@ struct border {
   bool needs_redraw;
   bool too_small;
   bool sticky;
+  // stays set until the deminimize animation ends
+  bool minimized;
   // edges ride in the target's ordering group, so a raise moves them along with no flash
   bool use_ordering_group;
 
@@ -109,6 +111,8 @@ void border_destroy(struct border* border);
 void border_move(struct border* border);
 void border_update(struct border* border, bool try_async);
 void border_hide(struct border* border);
+void border_set_minimized(struct border* border, bool minimized);
+void border_set_alpha(struct border* border, float alpha);
 void border_unhide(struct border* border);
 
 struct settings* border_get_settings(struct border* border);

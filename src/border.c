@@ -7,6 +7,12 @@
 #include <time.h>
 
 extern struct settings g_settings;
+extern uint64_t g_dock_animation_until;
+extern bool g_mission_control;
+
+static bool dock_animation_running(void) {
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < g_dock_animation_until;
+}
 
 struct settings* border_get_settings(struct border* border) {
   assert(pthread_main_np() != 0);
@@ -251,7 +257,7 @@ void border_create_window(struct border* border, CGRect frame, bool unmanaged, b
 }
 
 void border_update_internal(struct border* border, struct settings* settings) {
-  if (border->external_proxy_wid) return;
+  if (border->external_proxy_wid || g_mission_control) return;
 
   int cid = border->cid;
   CGRect frame;
@@ -264,10 +270,17 @@ void border_update_internal(struct border* border, struct settings* settings) {
 
   bool shown = false;
   SLSWindowIsOrderedIn(cid, border->target_wid, &shown);
-  if (!shown && !border->is_proxy) {
+  // the tag appears when the minimize animation starts
+  // it is cleared when the deminimize animation starts, so wait for that to end
+  bool minimized = (tags & WINDOW_TAG_MINIMIZED)
+                   || (border->minimized && dock_animation_running());
+  if (minimized != border->minimized) border_set_minimized(border, minimized);
+
+  // a minimizing window stays ordered in until its animation ends
+  if ((!shown || minimized) && !border->is_proxy) {
     border_hide(border);
     return;
-  } 
+  }
 
   // asked once per process, and again only after a group request fails
   static int sa_supports_ordering_group = -1;
@@ -519,13 +532,61 @@ void border_hide(struct border* border) {
   pthread_mutex_unlock(&border->mutex);
 }
 
+void border_set_alpha(struct border* border, float alpha) {
+  pthread_mutex_lock(&border->mutex);
+  CFTypeRef transaction = SLSTransactionCreate(border->cid);
+  if (transaction) {
+    for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+      if (!border->edges[i].wid) continue;
+      SLSTransactionSetWindowAlpha(transaction, border->edges[i].wid, alpha);
+    }
+    SLSTransactionCommit(transaction, 0);
+    CFRelease(transaction);
+  }
+  pthread_mutex_unlock(&border->mutex);
+}
+
+// the dock orders the target's ordering group back in with it on deminimize
+// so a minimized border is also made transparent
+void border_set_minimized(struct border* border, bool minimized) {
+  pthread_mutex_lock(&border->mutex);
+  border->minimized = minimized;
+  CFTypeRef transaction = SLSTransactionCreate(border->cid);
+  if (transaction) {
+    for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+      if (!border->edges[i].wid) continue;
+      SLSTransactionSetWindowAlpha(transaction,
+                                   border->edges[i].wid,
+                                   minimized ? 0.f : 1.f);
+      if (minimized) {
+        SLSTransactionOrderWindow(transaction,
+                                  border->edges[i].wid,
+                                  0,
+                                  border->target_wid  );
+      }
+    }
+    SLSTransactionCommit(transaction, 0);
+    CFRelease(transaction);
+  }
+  pthread_mutex_unlock(&border->mutex);
+}
+
 void border_unhide(struct border* border) {
   pthread_mutex_lock(&border->mutex);
   if (border->too_small
       || border->external_proxy_wid
+      || g_mission_control
       || (!border->sticky && !is_space_visible(border->cid, border->sid))) {
     pthread_mutex_unlock(&border->mutex);
     return;
+  }
+
+  if (border->minimized) {
+    if (dock_animation_running()) {
+      pthread_mutex_unlock(&border->mutex);
+      return;
+    }
+    border_set_minimized(border, false);
   }
 
   struct settings* settings = border_get_settings(border);

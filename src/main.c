@@ -25,6 +25,9 @@
 CFArrayRef (* JBSLSWindowIteratorGetCornerRadii)(CFTypeRef) = NULL;
 
 pid_t g_pid;
+// uptime in ns until which a dock minimize or deminimize animation counts as running
+uint64_t g_dock_animation_until;
+bool g_mission_control;
 mach_port_t g_server_port;
 struct table g_windows;
 struct mach_server g_mach_server;

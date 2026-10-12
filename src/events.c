@@ -6,6 +6,7 @@
 
 extern struct table g_windows;
 extern pid_t g_pid;
+extern uint64_t g_dock_animation_until;
 
 #ifdef DEBUG
 static void dump_event(void* data, size_t data_length) {
@@ -43,6 +44,8 @@ static void window_spawn_handler(uint32_t event, struct window_spawn_data* data,
   if (!wid || !sid || is_own_window(cid, wid)) return;
 
   if (event == EVENT_WINDOW_CREATE) {
+    // a slow mission control gesture creates the spaces bar without changing the front app
+    windows_check_mission_control(windows);
     if (windows_window_create(windows, wid, sid)) {
       debug("Window Created: %d %d\n", wid, sid);
       windows_determine_and_focus_active_window(windows);
@@ -95,9 +98,30 @@ static void window_modify_handler(uint32_t event, uint32_t* window_id, size_t _,
 
 static void front_app_handler() {
   debug("Window Focus\n");
+  // mission control changes the front app as it opens, sometimes before its overlay shows
+  windows_check_mission_control(&g_windows);
   DELAY_ASYNC_EXEC_ON_MAIN_THREAD(50000, {
+    windows_check_mission_control(&g_windows);
     windows_determine_and_focus_active_window(&g_windows);
   });
+}
+
+#define SPACE_TYPE_DOCK_ANIMATION 3
+
+static void space_create_handler(uint32_t event, uint64_t* sid, size_t _, int cid) {
+  debug("Space Create: %llu\n", *sid);
+  if (SLSSpaceGetType(cid, *sid) == SPACE_TYPE_DOCK_ANIMATION) {
+    // capped so a missed destroy event cannot keep borders hidden
+    g_dock_animation_until = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + NSEC_PER_SEC;
+  }
+  windows_hide_minimizing(&g_windows);
+}
+
+static void space_destroy_handler(uint32_t event, uint64_t* sid, size_t _, int cid) {
+  debug("Space Destroy: %llu\n", *sid);
+  if (SLSSpaceGetType(cid, *sid) != SPACE_TYPE_DOCK_ANIMATION) return;
+  g_dock_animation_until = 0;
+  windows_update_minimized(&g_windows);
 }
 
 static void space_handler() {
@@ -121,6 +145,9 @@ void events_register(int cid) {
   SLSRegisterNotifyProc(window_modify_handler, EVENT_WINDOW_UPDATE, cid_ctx);
   SLSRegisterNotifyProc(window_spawn_handler, EVENT_WINDOW_CREATE, cid_ctx);
   SLSRegisterNotifyProc(window_spawn_handler, EVENT_WINDOW_DESTROY, cid_ctx);
+
+  SLSRegisterNotifyProc(space_create_handler, EVENT_SPACE_CREATE, cid_ctx);
+  SLSRegisterNotifyProc(space_destroy_handler, EVENT_SPACE_DESTROY, cid_ctx);
 
   SLSRegisterNotifyProc(space_handler, EVENT_SPACE_CHANGE, cid_ctx);
 
