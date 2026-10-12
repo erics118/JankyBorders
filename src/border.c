@@ -391,7 +391,9 @@ void border_unhide(struct border* border) {
     return;
   }
 
-  if (border->wid) {
+  bool shown = false;
+  if (border->wid) SLSWindowIsOrderedIn(border->cid, border->wid, &shown);
+  if (border->wid && !shown) {
     struct settings* settings = border_get_settings(border);
     CFTypeRef transaction = SLSTransactionCreate(border->cid);
     if (transaction) {
