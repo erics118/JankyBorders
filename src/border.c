@@ -192,8 +192,9 @@ void border_update_internal(struct border* border, struct settings* settings) {
     return;
   } 
 
-  int level = window_level(cid, border->target_wid);
-  int sub_level = window_sub_level(cid, border->target_wid);
+  // one level above the target so raising a window at its level can never cover the border
+  int level = window_level(cid, border->target_wid) + 1;
+  int sub_level = 0;
 
   if (!border->wid) {
     border_create_window(border,
