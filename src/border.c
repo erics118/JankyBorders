@@ -91,6 +91,9 @@ static void border_draw(struct border* border, CGRect frame, struct settings* se
                             BORDER_TSMN            );
 
     CGPathAddRect(inner_clip_path, NULL, path_rect);
+  } else if (settings->border_style == BORDER_STYLE_SQUARE) {
+    // a rounded clip would leave a rounded notch inside the square corners
+    CGPathAddRect(inner_clip_path, NULL, CGRectInset(path_rect, 1.0, 1.0));
   } else {
     CGPathAddRoundedRect(inner_clip_path,
                          NULL,
