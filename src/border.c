@@ -1,6 +1,7 @@
 #include "border.h"
 #include "hashtable.h"
 #include "misc/extern.h"
+#include "misc/yabai_sa.h"
 #include "windows.h"
 #include <pthread.h>
 #include <time.h>
@@ -15,10 +16,57 @@ struct settings* border_get_settings(struct border* border) {
 }
 
 static void border_destroy_window(struct border* border) {
-  if (border->context) CGContextRelease(border->context);
-  if (border->wid) SLSReleaseWindow(border->cid, border->wid);
-  border->wid = 0;
-  border->context = NULL;
+  for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+    struct border_edge* edge = &border->edges[i];
+    if (edge->grouped) yabai_sa_ordering_group(border->target_wid, edge->wid, 0);
+    if (edge->context) CGContextRelease(edge->context);
+    if (edge->wid) SLSReleaseWindow(border->cid, edge->wid);
+    edge->wid = 0;
+    edge->context = NULL;
+    edge->grouped = false;
+  }
+}
+
+static bool border_edge_active(struct border_edge* edge) {
+  return edge->wid && !CGRectIsEmpty(edge->rect);
+}
+
+static CGPoint border_edge_origin(struct border* border, struct border_edge* edge) {
+  return (CGPoint){ border->origin.x + edge->rect.origin.x,
+                    border->origin.y + edge->rect.origin.y };
+}
+
+static void border_edge_rects(struct border* border, CGRect frame, struct settings* settings, CGRect rects[BORDER_EDGE_COUNT]) {
+  // the target's edge sits this far inside the frame
+  float edge = settings->border_width + BORDER_PADDING;
+  bool glow = settings->active_window.stype == COLOR_STYLE_GLOW
+              || settings->inactive_window.stype == COLOR_STYLE_GLOW;
+
+  // a glow spreads into the padding, a plain line ends half its width outside the edge
+  float outer = glow ? 0.f : fmaxf(floorf(edge - settings->border_width / 2.f) - 1.f, 0.f);
+  // deepest the drawing reaches inside the edge, following the inner clip in border_draw_frame
+  float inner = edge + 1.f;
+  if (settings->border_style != BORDER_STYLE_SQUARE) {
+    inner += 0.3f * border->inner_radius;
+  } else if (settings->border_order == BORDER_ORDER_ABOVE
+             && settings->border_width >= BORDER_TSMW) {
+    inner += BORDER_TSMN;
+  }
+  inner = ceilf(inner);
+
+  CGRect ring = CGRectInset(frame, outer, outer);
+  float width = ring.size.width;
+  float height = ring.size.height;
+  float depth = inner - outer;
+  float half = ceilf(height / 2.f);
+  // the background fills the whole inside, so the top and bottom edges split it
+  if (depth > half || (settings->show_background && settings->border_order != 1)) depth = half;
+
+  float side_height = fmaxf(height - 2.f * depth, 0.f);
+  rects[0] = CGRectMake(outer, outer, width, depth);
+  rects[1] = CGRectMake(outer, outer + height - depth, width, depth);
+  rects[2] = CGRectMake(outer, outer + depth, depth, side_height);
+  rects[3] = CGRectMake(outer + width - depth, outer + depth, depth, side_height);
 }
 
 static bool border_check_too_small(struct border* border, CGRect window_frame) {
@@ -55,9 +103,8 @@ static bool border_calculate_bounds(struct border* border, CGRect* frame, struct
   return true;
 }
 
-static void border_draw(struct border* border, CGRect frame, struct settings* settings) {
-  CGContextSaveGState(border->context);
-  border->needs_redraw = false;
+static void border_draw_frame(struct border* border, CGContextRef context, CGRect frame, struct settings* settings) {
+  CGContextSaveGState(context);
   struct color_style color_style = border->focused
                                    ? settings->active_window
                                    : settings->inactive_window;
@@ -67,7 +114,7 @@ static void border_draw(struct border* border, CGRect frame, struct settings* se
   if (color_style.stype == COLOR_STYLE_SOLID
      || color_style.stype == COLOR_STYLE_GLOW) {
     bool glow = color_style.stype == COLOR_STYLE_GLOW;
-    drawing_set_stroke_and_fill(border->context, color_style.color, glow);
+    drawing_set_stroke_and_fill(context, color_style.color, glow);
   } else if (color_style.stype == COLOR_STYLE_GRADIENT) {
     CGAffineTransform trans = CGAffineTransformMakeScale(frame.size.width,
                                                          frame.size.height);
@@ -76,8 +123,8 @@ static void border_draw(struct border* border, CGRect frame, struct settings* se
                                        gradient_dir          );
   }
 
-  CGContextSetLineWidth(border->context, settings->border_width);
-  CGContextClearRect(border->context, frame);
+  CGContextSetLineWidth(context, settings->border_width);
+  CGContextClearRect(context, frame);
 
   CGRect path_rect = border->drawing_bounds;
   CGMutablePathRef inner_clip_path = CGPathCreateMutable();
@@ -101,17 +148,17 @@ static void border_draw(struct border* border, CGRect frame, struct settings* se
                          border->inner_radius,
                          border->inner_radius             );
   }
-  drawing_clip_between_rect_and_path(border->context, frame, inner_clip_path);
+  drawing_clip_between_rect_and_path(context, frame, inner_clip_path);
 
   if (settings->border_style == BORDER_STYLE_SQUARE) {
     if (color_style.stype == COLOR_STYLE_SOLID
        || color_style.stype == COLOR_STYLE_GLOW) {
-      drawing_draw_square_with_inset(border->context,
+      drawing_draw_square_with_inset(context,
                                      path_rect,
                                      -settings->border_width / 2.f);
     }
     else if (color_style.stype == COLOR_STYLE_GRADIENT) {
-      drawing_draw_square_gradient_with_inset(border->context,
+      drawing_draw_square_gradient_with_inset(context,
                                               gradient,
                                               gradient_dir,
                                               path_rect,
@@ -121,7 +168,7 @@ static void border_draw(struct border* border, CGRect frame, struct settings* se
     float corner_radius = settings->border_style == BORDER_STYLE_ROUND_UNIFORM ? 9.0 : border->radius;
 
     if (settings->border_style == BORDER_STYLE_ROUND_UNIFORM) {
-      drawing_draw_rounded_rect_with_inset(border->context,
+      drawing_draw_rounded_rect_with_inset(context,
                                            path_rect,
                                            corner_radius,
                                            true            );
@@ -129,12 +176,12 @@ static void border_draw(struct border* border, CGRect frame, struct settings* se
 
     if (color_style.stype == COLOR_STYLE_SOLID
        || color_style.stype == COLOR_STYLE_GLOW) {
-      drawing_draw_rounded_rect_with_inset(border->context,
+      drawing_draw_rounded_rect_with_inset(context,
                                            path_rect,
                                            corner_radius,
                                            false           );
     } else if (color_style.stype == COLOR_STYLE_GRADIENT) {
-      drawing_draw_rounded_gradient_with_inset(border->context,
+      drawing_draw_rounded_gradient_with_inset(context,
                                                gradient,
                                                gradient_dir,
                                                path_rect,
@@ -144,35 +191,62 @@ static void border_draw(struct border* border, CGRect frame, struct settings* se
   CGGradientRelease(gradient);
 
   if (settings->show_background && settings->border_order != 1) {
-    CGContextRestoreGState(border->context);
-    CGContextSaveGState(border->context);
+    CGContextRestoreGState(context);
+    CGContextSaveGState(context);
     color_style = settings->background;
     if (color_style.stype == COLOR_STYLE_SOLID
        || color_style.stype == COLOR_STYLE_GLOW) {
-      drawing_draw_filled_path(border->context,
+      drawing_draw_filled_path(context,
                                inner_clip_path,
                                color_style.color);
     }
   }
   CFRelease(inner_clip_path);
-  CGContextFlush(border->context);
-  CGContextRestoreGState(border->context);
-  SLSFlushWindowContentRegion(border->cid, border->wid, NULL);
-  SLSWindowThaw(border->cid, border->wid);
+  CGContextRestoreGState(context);
+}
+
+static void border_draw(struct border* border, CGRect frame, struct settings* settings) {
+  border->needs_redraw = false;
+  for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+    struct border_edge* edge = &border->edges[i];
+    if (!border_edge_active(edge)) continue;
+
+    CGContextSaveGState(edge->context);
+    // window contexts have their origin at the bottom left
+    CGContextTranslateCTM(edge->context,
+                          -edge->rect.origin.x,
+                          -(frame.size.height - CGRectGetMaxY(edge->rect)));
+    border_draw_frame(border, edge->context, frame, settings);
+    CGContextFlush(edge->context);
+    CGContextRestoreGState(edge->context);
+    SLSFlushWindowContentRegion(border->cid, edge->wid, NULL);
+    SLSWindowThaw(border->cid, edge->wid);
+  }
+}
+
+static void border_create_edge(struct border* border, struct border_edge* edge, CGRect rect, bool unmanaged, bool hidpi) {
+  int cid = border->cid;
+  CGRect window_frame = CGRectIsNull(rect)
+                        ? CGRectNull
+                        : (CGRect){ CGPointZero, rect.size };
+  edge->wid = window_create(cid, window_frame, hidpi, unmanaged);
+  edge->rect = rect;
+  edge->context = SLWindowContextCreate(cid, edge->wid, NULL);
+  CGContextSetInterpolationQuality(edge->context, kCGInterpolationNone);
+
+  if (!border->sid) border->sid = window_space_id(cid, border->target_wid);
+  window_send_to_space(cid, edge->wid, border->sid);
+  border->needs_redraw = true;
 }
 
 void border_create_window(struct border* border, CGRect frame, bool unmanaged, bool hidpi) {
   pthread_mutex_lock(&border->mutex);
-  int cid = border->cid;
-  border->wid = window_create(cid, frame, hidpi, unmanaged);
-
+  for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+    if (!border->edges[i].wid) {
+      border_create_edge(border, &border->edges[i], CGRectNull, unmanaged, hidpi);
+    }
+  }
   border->frame = frame;
-  border->needs_redraw = true;
-  border->context = SLWindowContextCreate(cid, border->wid, NULL);
-  CGContextSetInterpolationQuality(border->context, kCGInterpolationNone);
-
-  if (!border->sid) border->sid = window_space_id(cid, border->target_wid);
-  window_send_to_space(cid, border->wid, border->sid);
   pthread_mutex_unlock(&border->mutex);
 }
 
@@ -195,29 +269,62 @@ void border_update_internal(struct border* border, struct settings* settings) {
     return;
   } 
 
-  // one level above the target so raising a window at its level can never cover the border
-  int level = window_level(cid, border->target_wid) + 1;
-  int sub_level = 0;
-
-  if (!border->wid) {
-    border_create_window(border,
-                         frame,
-                         border->is_proxy,
-                         settings->hidpi  );
+  // asked once per process, and again only after a group request fails
+  static int sa_supports_ordering_group = -1;
+  if (sa_supports_ordering_group == -1) {
+    sa_supports_ordering_group = yabai_sa_supports_ordering_group();
+  }
+  if (!border->edges[0].wid && !border->is_proxy) {
+    border->use_ordering_group = sa_supports_ordering_group;
   }
 
+  // grouped edges stay at the target's level, so windows in front of the target cover them
+  // otherwise one level above the target, so raising the target can never cover the border
+  int level = window_level(cid, border->target_wid)
+              + (border->use_ordering_group ? 0 : 1);
+  int sub_level = 0;
+
+  CGRect rects[BORDER_EDGE_COUNT];
+  border_edge_rects(border, frame, settings, rects);
+
   bool disabled_update = false;
+  for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+    struct border_edge* edge = &border->edges[i];
+    if (CGRectIsEmpty(rects[i])) {
+      if (edge->wid) {
+        CFTypeRef transaction = SLSTransactionCreate(cid);
+        if (transaction) {
+          SLSTransactionOrderWindow(transaction, edge->wid, 0, border->target_wid);
+          SLSTransactionCommit(transaction, 0);
+          CFRelease(transaction);
+        }
+      }
+      edge->rect = rects[i];
+      continue;
+    }
+
+    if (!edge->wid) {
+      border_create_edge(border, edge, rects[i], border->is_proxy, settings->hidpi);
+    } else if (!CGRectEqualToRect(rects[i], edge->rect)) {
+      if (!disabled_update) {
+        disabled_update = true;
+        SLSDisableUpdate(cid);
+      }
+
+      edge->rect = rects[i];
+      CGRect shape = { CGPointZero, rects[i].size };
+      CGPoint origin = border_edge_origin(border, edge);
+      CFTypeRef shape_region;
+      CGSNewRegionWithRect(&shape, &shape_region);
+
+      SLSWindowFreezeWithOptions(cid, edge->wid, NULL);
+      SLSSetWindowShape(cid, edge->wid, origin.x, origin.y, shape_region);
+      CFRelease(shape_region);
+      border->needs_redraw = true;
+    }
+  }
+
   if (!CGRectEqualToRect(frame, border->frame)) {
-    disabled_update = true;
-    SLSDisableUpdate(cid);
-
-    CFTypeRef frame_region;
-    CGSNewRegionWithRect(&frame, &frame_region);
-
-    SLSWindowFreezeWithOptions(border->cid, border->wid, NULL);
-    SLSSetWindowShape(border->cid, border->wid, border->origin.x, border->origin.y, frame_region);
-    CFRelease(frame_region);
-
     border->needs_redraw = true;
     border->frame = frame;
   }
@@ -226,26 +333,45 @@ void border_update_internal(struct border* border, struct settings* settings) {
 
   CFTypeRef transaction = SLSTransactionCreate(cid);
   if(!transaction) return;
-  SLSTransactionMoveWindowWithGroup(transaction, border->wid, border->origin);
+  for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+    struct border_edge* edge = &border->edges[i];
+    if (!border_edge_active(edge)) continue;
 
-  if (!border->is_proxy) {
-    CGAffineTransform transform = CGAffineTransformIdentity;
-    transform.tx = -border->origin.x;
-    transform.ty = -border->origin.y;
-    SLSTransactionSetWindowTransform(transaction,
-                                     border->wid,
-                                     0,
-                                     0,
-                                     transform   );
+    CGPoint origin = border_edge_origin(border, edge);
+    SLSTransactionMoveWindowWithGroup(transaction, edge->wid, origin);
+
+    if (!border->is_proxy) {
+      CGAffineTransform transform = CGAffineTransformIdentity;
+      transform.tx = -origin.x;
+      transform.ty = -origin.y;
+      SLSTransactionSetWindowTransform(transaction,
+                                       edge->wid,
+                                       0,
+                                       0,
+                                       transform   );
+    }
+    SLSTransactionSetWindowLevel(transaction, edge->wid, level);
+    SLSTransactionSetWindowSubLevel(transaction, edge->wid, sub_level);
+    SLSTransactionOrderWindow(transaction,
+                              edge->wid,
+                              settings->border_order,
+                              border->target_wid      );
   }
-  SLSTransactionSetWindowLevel(transaction, border->wid, level);
-  SLSTransactionSetWindowSubLevel(transaction, border->wid, sub_level);
-  SLSTransactionOrderWindow(transaction,
-                            border->wid,
-                            settings->border_order,
-                            border->target_wid      );
   SLSTransactionCommit(transaction, 0);
   CFRelease(transaction);
+
+  if (border->use_ordering_group) {
+    for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+      struct border_edge* edge = &border->edges[i];
+      if (!border_edge_active(edge) || edge->grouped) continue;
+      edge->grouped = yabai_sa_ordering_group(border->target_wid, edge->wid, 1);
+      // the scripting addition went away, so fall back to level + 1 on the next update
+      if (!edge->grouped) {
+        border->use_ordering_group = false;
+        sa_supports_ordering_group = -1;
+      }
+    }
+  }
 
   uint64_t set_tags = (1ULL << 1) | (1ULL << 9);
   uint64_t clear_tags = 0;
@@ -255,8 +381,12 @@ void border_update_internal(struct border* border, struct settings* settings) {
     clear_tags |= (1ULL << 45);
   }
 
-  SLSSetWindowTags(cid, border->wid, &set_tags, 0x40);
-  SLSClearWindowTags(cid, border->wid, &clear_tags, 0x40);
+  for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+    struct border_edge* edge = &border->edges[i];
+    if (!border_edge_active(edge)) continue;
+    SLSSetWindowTags(cid, edge->wid, &set_tags, 0x40);
+    SLSClearWindowTags(cid, edge->wid, &clear_tags, 0x40);
+  }
 
   if (disabled_update) SLSReenableUpdate(cid);
 }
@@ -327,14 +457,20 @@ void border_move(struct border* border) {
                             - settings->border_width
                             - BORDER_PADDING          };
 
+    border->target_bounds = window_frame;
+    border->origin = origin;
     CFTypeRef transaction = SLSTransactionCreate(border->cid);
     if (transaction) {
-      SLSTransactionMoveWindowWithGroup(transaction, border->wid, origin);
+      for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+        struct border_edge* edge = &border->edges[i];
+        if (!border_edge_active(edge)) continue;
+        SLSTransactionMoveWindowWithGroup(transaction,
+                                          edge->wid,
+                                          border_edge_origin(border, edge));
+      }
       SLSTransactionCommit(transaction, 0);
       CFRelease(transaction);
     }
-    border->target_bounds = window_frame;
-    border->origin = origin;
     pthread_mutex_unlock(&border->mutex);
   });
 }
@@ -346,7 +482,7 @@ void border_update(struct border* border, bool try_async) {
   pthread_mutex_unlock(&border->mutex);
   return;
 
-  if (!border->wid || !try_async) {
+  if (!border->edges[0].wid || !try_async) {
     border_update_internal(border, settings);
     pthread_mutex_unlock(&border->mutex);
     return;
@@ -368,16 +504,17 @@ void border_update(struct border* border, bool try_async) {
 
 void border_hide(struct border* border) {
   pthread_mutex_lock(&border->mutex);
-  if (border->wid) {
-    CFTypeRef transaction = SLSTransactionCreate(border->cid);
-    if (transaction) {
+  CFTypeRef transaction = SLSTransactionCreate(border->cid);
+  if (transaction) {
+    for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+      if (!border->edges[i].wid) continue;
       SLSTransactionOrderWindow(transaction,
-                                border->wid,
+                                border->edges[i].wid,
                                 0,
-                                border->target_wid);
-      SLSTransactionCommit(transaction, 0);
-      CFRelease(transaction);
+                                border->target_wid  );
     }
+    SLSTransactionCommit(transaction, 0);
+    CFRelease(transaction);
   }
   pthread_mutex_unlock(&border->mutex);
 }
@@ -391,17 +528,18 @@ void border_unhide(struct border* border) {
     return;
   }
 
-  if (border->wid) {
-    struct settings* settings = border_get_settings(border);
-    CFTypeRef transaction = SLSTransactionCreate(border->cid);
-    if (transaction) {
+  struct settings* settings = border_get_settings(border);
+  CFTypeRef transaction = SLSTransactionCreate(border->cid);
+  if (transaction) {
+    for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+      if (!border_edge_active(&border->edges[i])) continue;
       SLSTransactionOrderWindow(transaction,
-                                border->wid,
+                                border->edges[i].wid,
                                 settings->border_order,
                                 border->target_wid      );
-      SLSTransactionCommit(transaction, 0);
-      CFRelease(transaction);
     }
+    SLSTransactionCommit(transaction, 0);
+    CFRelease(transaction);
   }
   pthread_mutex_unlock(&border->mutex);
 }

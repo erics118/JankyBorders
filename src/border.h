@@ -58,6 +58,18 @@ struct event_buffer {
   int64_t last_coalesce_attempt;
 };
 
+// one window per side, so no border window covers the inside of its target
+// window pickers in screenshot tools then select the target, not the border
+#define BORDER_EDGE_COUNT 4
+
+struct border_edge {
+  uint32_t wid;
+  CGContextRef context;
+  // in border frame coordinates, origin top left
+  CGRect rect;
+  bool grouped;
+};
+
 struct border {
   pthread_mutex_t mutex;
   int cid;
@@ -66,9 +78,11 @@ struct border {
   bool needs_redraw;
   bool too_small;
   bool sticky;
+  // edges ride in the target's ordering group, so a raise moves them along with no flash
+  bool use_ordering_group;
 
   uint64_t sid;
-  uint32_t wid;
+  struct border_edge edges[BORDER_EDGE_COUNT];
   uint32_t target_wid;
 
   float radius;
@@ -78,7 +92,6 @@ struct border {
   CGRect frame;
   CGRect target_bounds;
   CGRect drawing_bounds;
-  CGContextRef context;
 
   struct animation animation;
   struct event_buffer event_buffer;

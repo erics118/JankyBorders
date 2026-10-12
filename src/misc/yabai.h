@@ -16,8 +16,8 @@ void border_update_internal(struct border* border, struct settings* settings);
 
 struct track_transform_payload {
   int cid;
-  uint32_t border_wid;
-  uint32_t proxy_wid;
+  struct border_edge border_edges[BORDER_EDGE_COUNT];
+  struct border_edge proxy_edges[BORDER_EDGE_COUNT];
   uint32_t target_wid;
   CGAffineTransform initial_transform;
 };
@@ -25,10 +25,28 @@ struct track_transform_payload {
 struct yabai_proxy_payload {
   union { struct border* proxy; struct border* border; };
   struct settings settings;
-  uint32_t border_wid;
+  struct border_edge border_edges[BORDER_EDGE_COUNT];
   uint32_t real_wid;
   uint32_t external_proxy_wid;
 };
+
+static inline void yabai_set_edges_transform(CFTypeRef transaction, struct border_edge* edges, CGAffineTransform transform) {
+  for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+    if (!edges[i].wid || CGRectIsEmpty(edges[i].rect)) continue;
+    // each edge window sits at its rect's offset inside the border frame
+    CGAffineTransform edge_transform
+      = CGAffineTransformConcat(transform,
+                                CGAffineTransformMakeTranslation(-edges[i].rect.origin.x,
+                                                                 -edges[i].rect.origin.y));
+    SLSTransactionSetWindowTransform(transaction, edges[i].wid, 0, 0, edge_transform);
+  }
+}
+
+static inline void yabai_set_edges_alpha(CFTypeRef transaction, struct border_edge* edges, float alpha) {
+  for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+    if (edges[i].wid) SLSTransactionSetWindowAlpha(transaction, edges[i].wid, alpha);
+  }
+}
 
 static CVReturn track_transform(CVDisplayLinkRef display_link, const CVTimeStamp* now, const CVTimeStamp* output_time, CVOptionFlags flags, CVOptionFlags* flags_out, void* context) {
   struct animation* animation = context;
@@ -47,8 +65,8 @@ static CVReturn track_transform(CVDisplayLinkRef display_link, const CVTimeStamp
 
   CFTypeRef transaction = SLSTransactionCreate(payload->cid);
   if (transaction) {
-    SLSTransactionSetWindowTransform(transaction, payload->proxy_wid, 0, 0, border_transform);
-    SLSTransactionSetWindowTransform(transaction, payload->border_wid, 0, 0, border_transform);
+    yabai_set_edges_transform(transaction, payload->proxy_edges, border_transform);
+    yabai_set_edges_transform(transaction, payload->border_edges, border_transform);
     SLSTransactionCommit(transaction, 0);
     CFRelease(transaction);
   }
@@ -66,8 +84,7 @@ static void* yabai_proxy_begin_proc(void* context) {
   CGRect proxy_frame;
   SLSGetWindowBounds(proxy->cid, info->external_proxy_wid, &proxy_frame);
 
-  payload->proxy_wid = proxy->wid;
-  payload->border_wid = info->border_wid;
+  memcpy(payload->border_edges, info->border_edges, sizeof(payload->border_edges));
   payload->target_wid = info->external_proxy_wid;
   payload->cid = proxy->cid;
 
@@ -81,24 +98,28 @@ static void* yabai_proxy_begin_proc(void* context) {
   payload->initial_transform.ty = 0.5*(proxy->frame.size.height
                                  - proxy->target_bounds.size.height);
 
-  animation_stop(&proxy->animation);
-  animation_start(&proxy->animation, track_transform, payload);
-
   if (!proxy->is_proxy) {
     proxy->is_proxy = true;
     proxy->frame = CGRectNull;
     border_update_internal(proxy, &info->settings);
   }
+  memcpy(payload->proxy_edges, proxy->edges, sizeof(payload->proxy_edges));
+
+  animation_stop(&proxy->animation);
+  animation_start(&proxy->animation, track_transform, payload);
 
   CFTypeRef transaction = SLSTransactionCreate(proxy->cid);
   if (transaction) {
-    SLSTransactionOrderWindow(transaction,
-                              proxy->wid,
-                              info->settings.border_order,
-                              info->external_proxy_wid    );
+    for (int i = 0; i < BORDER_EDGE_COUNT; i++) {
+      if (!proxy->edges[i].wid || CGRectIsEmpty(proxy->edges[i].rect)) continue;
+      SLSTransactionOrderWindow(transaction,
+                                proxy->edges[i].wid,
+                                info->settings.border_order,
+                                info->external_proxy_wid    );
+    }
 
-    SLSTransactionSetWindowAlpha(transaction, info->border_wid, 0.f);
-    SLSTransactionSetWindowAlpha(transaction, proxy->wid, 1.f);
+    yabai_set_edges_alpha(transaction, info->border_edges, 0.f);
+    yabai_set_edges_alpha(transaction, proxy->edges, 1.f);
     SLSTransactionCommit(transaction, 0);
     CFRelease(transaction);
   }
@@ -144,7 +165,7 @@ static inline void yabai_proxy_begin(struct table* windows, uint32_t wid, uint32
     struct yabai_proxy_payload* payload
                             = malloc(sizeof(struct yabai_proxy_payload));
     payload->proxy = border->proxy;
-    payload->border_wid = border->wid;
+    memcpy(payload->border_edges, border->edges, sizeof(payload->border_edges));
     payload->external_proxy_wid = border->external_proxy_wid;
     payload->real_wid = real_wid;
     payload->settings = *border_get_settings(border);
@@ -167,8 +188,8 @@ static inline void yabai_proxy_end(struct table* windows, uint32_t wid, uint32_t
 
     CFTypeRef transaction = SLSTransactionCreate(border->cid);
     if (transaction) {
-      SLSTransactionSetWindowAlpha(transaction, proxy->wid, 0.f);
-      SLSTransactionSetWindowAlpha(transaction, border->wid, 1.f);
+      yabai_set_edges_alpha(transaction, proxy->edges, 0.f);
+      yabai_set_edges_alpha(transaction, border->edges, 1.f);
       SLSTransactionCommit(transaction, 0);
       CFRelease(transaction);
     }
@@ -180,7 +201,7 @@ static inline void yabai_proxy_end(struct table* windows, uint32_t wid, uint32_t
                                   = malloc(sizeof(struct yabai_proxy_payload));
 
     payload->border = border;
-    payload->border_wid = border->wid;
+    memcpy(payload->border_edges, border->edges, sizeof(payload->border_edges));
     payload->settings = *border_get_settings(border);
 
     dispatch_async(dispatch_get_main_queue(), ^{
